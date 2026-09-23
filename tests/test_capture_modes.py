@@ -147,11 +147,90 @@ class DeviceModeParsingTests(unittest.TestCase):
         fallback = source._parse_device_modes(_GC573_LIST_OPTIONS, preferred_format="p010")
         self.assertIn((1280, 720), fallback)
 
+    def test_inf_lower_bound_keeps_fixed_high_resolution_mode(self) -> None:
+        output = (
+            "pixel_format=bgr24 min s=2560x1440 fps=inf "
+            "max s=2560x1440 fps=120\n"
+        )
+        ranges = self._source()._parse_device_modes(output)
+        self.assertEqual(ranges[(2560, 1440)], (120.0, 120.0))
+        self.assertIn((2560, 1440, 120), selectable_modes_from_ranges(ranges))
+
     def test_pixel_format_setting_normalisation(self) -> None:
         for raw in (None, "", "auto", "AUTO", "default", "driver"):
             self.assertIsNone(frame_source.normalize_pixel_format(raw), raw)
         self.assertEqual(frame_source.normalize_pixel_format(" NV12 "), "nv12")
         self.assertIsNone(self._source()._card_pixel_format)
+
+    def test_elgato_without_bgr24_uses_nv12_modes(self) -> None:
+        output = (
+            "pixel_format=yuyv422  min s=1920x1080 fps=60 max s=1920x1080 fps=60\n"
+            "pixel_format=nv12  min s=2560x1440 fps=50 max s=2560x1440 fps=120\n"
+            "pixel_format=nv12  min s=1920x1080 fps=24 max s=1920x1080 fps=240\n"
+        )
+        source = self._source()
+        by_format = source._parse_all_device_formats(output)
+        order = source._format_try_order(by_format, None)
+        self.assertEqual(order[0], "nv12")
+        self.assertIn("yuyv422", order)
+        self.assertNotIn("bgr24", order)
+        ranges = source._parse_device_modes(output)
+        self.assertEqual(ranges[(2560, 1440)], (50.0, 120.0))
+        self.assertIn((2560, 1440, 120), selectable_modes_from_ranges(ranges))
+
+    def test_unsupported_mode_error_is_not_busy(self) -> None:
+        source = self._source()
+        text = "Could not set video options | Error opening input: I/O error | Error opening input file video=Game Capture 4K60 Pro MK.2."
+        self.assertTrue(source._error_means_unsupported_mode(text))
+        self.assertFalse(source._error_means_busy(text))
+        source.last_open_error = text
+        self.assertIn("NV12", source.open_error_message())
+
+
+class CalibrationFallbackTests(unittest.TestCase):
+    def test_strict_fail_with_frames_reopens_degraded_live_capture(self) -> None:
+        source = frame_source.FrameSource(
+            {
+                "capture_mode": "camera",
+                "capture_device_name": "AVerMedia HD Capture GC573 1",
+                "capture_device_kind": "Capture Card",
+            }
+        )
+        probe = mock.Mock()
+        probe.isOpened.return_value = True
+        probe.read.return_value = (True, object())
+        probe.get_last_error.return_value = ""
+
+        def fake_measure(_device, width, height, fps):
+            return False, 40, None
+
+        with mock.patch.object(source, "_measure_candidate", side_effect=fake_measure), mock.patch.object(
+            frame_source, "FFmpegRawVideoCapture", return_value=probe
+        ), mock.patch.object(frame_source, "_wait_for_lingering_ffmpeg", return_value=0), mock.patch.object(
+            frame_source.time, "sleep"
+        ):
+            width, height, fps, live = source._calibrate_capture_mode("card", [(1920, 1080, 60.0), (1280, 720, 60.0)])
+        self.assertEqual((width, height, fps), (1920, 1080, 60.0))
+        self.assertIs(live, probe)
+
+    def test_zero_frame_io_error_does_not_reopen_the_rejected_mode(self) -> None:
+        source = frame_source.FrameSource(
+            {
+                "capture_mode": "camera",
+                "capture_device_name": "Game Capture 4K60 Pro MK.2",
+                "capture_device_kind": "Capture Card",
+            }
+        )
+        source.last_open_error = "Could not set video options"
+        with mock.patch.object(source, "_measure_candidate", return_value=(False, 0, None)), mock.patch.object(
+            frame_source, "FFmpegRawVideoCapture"
+        ) as ctor, mock.patch.object(frame_source, "_wait_for_lingering_ffmpeg", return_value=0), mock.patch.object(
+            frame_source.time, "sleep"
+        ):
+            width, height, fps, live = source._calibrate_capture_mode("card", [(2560, 1440, 120.0)])
+        self.assertEqual((width, height, fps), (2560, 1440, 120.0))
+        self.assertIsNone(live)
+        ctor.assert_not_called()
 
 
 if __name__ == "__main__":

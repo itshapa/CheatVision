@@ -189,6 +189,12 @@ class ControlBar(QWidget):
 
     def set_stream_mode(self, mode: str) -> None:
         self.capture_mode_group.setVisible(mode != "live")
+        if mode == "vod":
+            self.mount_vod_btn.setText("LIVE")
+            self.mount_vod_btn.setToolTip("Leave the imported file and return to the live capture device.")
+        else:
+            self.mount_vod_btn.setText("IMPORT")
+            self.mount_vod_btn.setToolTip("Import a gameplay VOD for review. Stops live capture.")
 
     def set_active_view_mode(self, mode_id: str) -> None:
         button = self.view_buttons.get(mode_id)

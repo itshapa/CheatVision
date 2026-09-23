@@ -29,6 +29,7 @@ RAIL_SIDE_MARGIN = 12
 # bare game feed (facecam corner, own weapon); STREAM is a stream page (top
 # and bottom chrome, chat column, facecam). vod_file has the STREAM masks.
 _MASK_ITEMS: tuple[tuple[str, str], ...] = (("GAME", "hdmi_game"), ("STREAM", "stream_window"))
+IMPORTED_VOD_TOKEN = "__imported_vod__"
 
 
 def _short_device_name(name: str) -> str:
@@ -201,7 +202,9 @@ class LeftRail(QWidget):
         "Where the picture comes from: one entry per input, by its own name. Capture cards, "
         "virtual cameras (OBS / Streaming Center / Streamlabs, so that app can record while "
         "CheatVision analyses) and webcams as Windows lists them, plus Browser window (a screen "
-        "grab of a Twitch / Kick / YouTube tab). What to ignore on the picture is the MASK below."
+        "grab of a Twitch / Kick / YouTube tab). Importing a file adds that file here so it is "
+        "not read as the capture card. Pick a device again (or LIVE) to return to live capture. "
+        "What to ignore on the picture is the MASK below."
     )
     _MASK_HELP = (
         "Which regions of the picture the analyser ignores. GAME: a bare game feed (facecam "
@@ -391,7 +394,7 @@ class LeftRail(QWidget):
 
     def _on_source_changed(self, index: int) -> None:
         name = self.source_combo.itemData(index)
-        if not name:
+        if not name or name == IMPORTED_VOD_TOKEN:
             return
         self._current_device_name = str(name)
         self.sourceSelected.emit(str(name))
@@ -492,6 +495,35 @@ class LeftRail(QWidget):
             if self.source_combo.itemData(i) == self._current_device_name:
                 self.source_combo.setCurrentIndex(i)
                 return
+
+    def _imported_source_index(self) -> int:
+        for i in range(self.source_combo.count()):
+            if self.source_combo.itemData(i) == IMPORTED_VOD_TOKEN:
+                return i
+        return -1
+
+    def set_imported_source(self, filename: str) -> None:
+        """Select the imported file in SOURCE so it is not shown as the capture card."""
+        label = filename if len(filename) <= 22 else filename[:19] + "..."
+        self.source_combo.blockSignals(True)
+        existing = self._imported_source_index()
+        if existing >= 0:
+            self.source_combo.removeItem(existing)
+        self.source_combo.insertItem(0, label, IMPORTED_VOD_TOKEN)
+        self.source_combo.setCurrentIndex(0)
+        self.source_combo.blockSignals(False)
+        self.source_combo.setToolTip(
+            f"{filename}\nImported file — not the capture card.\n\n{self._SELECTOR_HELP}"
+        )
+
+    def clear_imported_source(self) -> None:
+        self.source_combo.blockSignals(True)
+        existing = self._imported_source_index()
+        if existing >= 0:
+            self.source_combo.removeItem(existing)
+        self._select_current()
+        self.source_combo.blockSignals(False)
+        self.source_combo.setToolTip(self._SELECTOR_HELP)
 
     def set_mask_profile(self, profile: str, *, locked: bool = False) -> None:
         """Reflect the mask in force (set by the window: live pick, VOD import,

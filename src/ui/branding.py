@@ -58,7 +58,7 @@ def brand_font(pixel_size: int, tracking: float, weight: QFont.Weight = QFont.We
     SIGNAL state. Stylesheets cannot express tracking, so these labels carry
     their font in code and the sheet only colours them."""
     font = QFont(BRAND_FONT_FAMILY)
-    font.setPixelSize(int(pixel_size))
+    font.setPixelSize(max(1, int(pixel_size)))
     font.setWeight(weight)
     font.setLetterSpacing(QFont.AbsoluteSpacing, float(tracking))
     return font

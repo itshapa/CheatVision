@@ -8,6 +8,7 @@ import threading
 import re
 import sys
 import ctypes
+import math
 from collections import deque
 from ctypes import wintypes
 from typing import Any
@@ -105,8 +106,9 @@ def _window_region(hwnd: int) -> dict[str, int] | None:
         return None
     return {"left": int(rect.left), "top": int(rect.top), "width": width, "height": height}
 
+_FPS_TOKEN = r"(?:[0-9.]+|inf)"
 _RANGE_MODE_PATTERN = re.compile(
-    r"(?:pixel_format|vcodec)=(\S+)\s+min s=(\d+)x(\d+) fps=([0-9.]+) max s=(\d+)x(\d+) fps=([0-9.]+)"
+    rf"(?:pixel_format|vcodec)=(\S+)\s+min s=(\d+)x(\d+) fps=({_FPS_TOKEN}) max s=(\d+)x(\d+) fps=({_FPS_TOKEN})"
 )
 _DISCRETE_MODE_PATTERN = re.compile(r"(?:pixel_format|vcodec)=(\S+)\s+s=(\d+)x(\d+) fps=([0-9.]+)")
 
@@ -133,13 +135,21 @@ _DISCRETE_MODE_PATTERN = re.compile(r"(?:pixel_format|vcodec)=(\S+)\s+s=(\d+)x(\
 # only the span's ceiling. A rate the device does not advertise is never
 # generated, and the bandwidth ceiling below still applies to each one.
 _FPS_STEP_LADDER = (360.0, 240.0, 165.0, 144.0, 120.0, 100.0, 90.0, 85.0, 75.0, 60.0, 50.0, 30.0, 24.0)
+# When a card does not advertise bgr24 (Elgato 4K60 Pro MK.2 typically does
+# not), open using a format it actually listed. RGB size/fps on an NV12 pin
+# is the "Could not set video options / I/O error" failure.
+_PIXEL_FORMAT_TRY_ORDER = ("bgr24", "nv12", "yuyv422", "uyvy422", "nv21", "bgr0")
 # Try every standard step within a resolution's supported range, not just the
 # fastest few -- the top fps values at a large resolution (144/120/90) tend
 # to be exactly the ones that overflow the capture buffer, and stopping the
 # per-resolution search too early skips right past slower-but-clean options
 # (measured on real hardware: 1920x1080@90 overflows but @75-85 is clean) in
 # favor of dropping to a much smaller resolution unnecessarily.
-_MAX_FPS_CANDIDATES_PER_RESOLUTION = 2
+# Keep a lower-rate fallback in the calibration ladder. Some capture cards
+# advertise 50/60 FPS but deliver 30 FPS when their input is shared or the
+# source signal is lower-rate; probing only the two fastest entries rejects a
+# usable source before its advertised 30 FPS mode can be tested.
+_MAX_FPS_CANDIDATES_PER_RESOLUTION = 3
 _MAX_CALIBRATION_CANDIDATES = 8
 _CALIBRATION_FPS_TOLERANCE = 0.5
 # A short test window is unreliable near the real bandwidth cliff: ffmpeg's
@@ -154,8 +164,10 @@ _CALIBRATION_SETTLE_SEC = 0.35
 _CALIBRATION_MIN_FPS_RATIO = 0.92
 # With -fps_mode passthrough the pipe carries only frames the driver really
 # produced, so a candidate is judged on steady delivery rather than on hitting
-# the nominal rate: anything at or above this is a healthy live feed.
-_CALIBRATION_MIN_ABSOLUTE_FPS = 50.0
+# the nominal rate. Some cards deliver a stable 30 FPS when asked for a 60 FPS
+# mode; accept that usable feed, while the 7-8 FPS result from a broken 30 FPS
+# negotiation still fails this floor.
+_CALIBRATION_MIN_ABSOLUTE_FPS = 25.0
 # A virtual camera whose host app has it switched off opens but never sends a
 # frame; how long to wait for the first one before reporting that.
 _VIRTUAL_CAMERA_FIRST_FRAME_SEC = 4.0
@@ -500,7 +512,15 @@ def _close_ffmpeg_pipes(process: subprocess.Popen[bytes] | None) -> None:
 
 
 class FFmpegRawVideoCapture:
-    def __init__(self, device_name: str, width: int, height: int, fps: int, pixel_format: str | None = None):
+    def __init__(
+        self,
+        device_name: str,
+        width: int,
+        height: int,
+        fps: int,
+        pixel_format: str | None = None,
+        pin_input_mode: bool = True,
+    ):
         self.device_name = device_name
         self.input_width = max(1, int(width))
         self.input_height = max(1, int(height))
@@ -508,6 +528,11 @@ class FFmpegRawVideoCapture:
         # DirectShow input pixel format to request (e.g. "bgr0" for virtual
         # cameras that only publish that); None lets the driver choose.
         self.input_pixel_format = pixel_format
+        # Elgato (and some other) dshow pins reject -video_size/-framerate
+        # combinations even when list_options advertised them for a different
+        # pixel format. pin_input_mode=False lets the driver pick, and the
+        # scale filter below still delivers a known-size BGR pipe.
+        self._pin_input_mode = bool(pin_input_mode)
         self.width, self.height, self.fps = _preview_geometry(self.input_width, self.input_height, self.input_fps)
         self._frame_size = self.width * self.height * 3
         self._process: subprocess.Popen[bytes] | None = None
@@ -619,11 +644,14 @@ class FFmpegRawVideoCapture:
         ]
         if self.input_pixel_format:
             args += ["-pixel_format", self.input_pixel_format]
+        if self._pin_input_mode:
+            args += [
+                "-framerate",
+                str(self.input_fps),
+                "-video_size",
+                f"{self.input_width}x{self.input_height}",
+            ]
         args += [
-            "-framerate",
-            str(self.input_fps),
-            "-video_size",
-            f"{self.input_width}x{self.input_height}",
             "-i",
             f"video={self.device_name}",
         ]
@@ -631,7 +659,7 @@ class FFmpegRawVideoCapture:
 
     def _video_filter(self) -> str:
         filters: list[str] = []
-        if self.width != self.input_width or self.height != self.input_height:
+        if (not self._pin_input_mode) or self.width != self.input_width or self.height != self.input_height:
             filters.append(
                 f"scale={self.width}:{self.height}:flags=lanczos+accurate_rnd+full_chroma_int"
             )
@@ -820,6 +848,7 @@ class FrameSource:
         self._capture_device_name = str(settings.get("capture_device_name", "")).strip()
         # Pixel format to ask a capture card for (None = driver's choice).
         self._card_pixel_format = normalize_pixel_format(settings.get("capture_pixel_format"))
+        self._active_pixel_format = self._card_pixel_format
         self.camera_index = int(settings.get("camera_index", 0))
         self.settings = settings.copy()
         # Screen-grab a browser window only when that pseudo-input was picked.
@@ -942,30 +971,37 @@ class FrameSource:
             ["ffmpeg", "-hide_banner", "-list_options", "true", "-f", "dshow", "-i", f"video={device_name}"],
             timeout=8.0,
         )
-        resolution_fps_ranges = (
-            self._parse_device_modes(output, preferred_format=self._card_pixel_format) if output.strip() else {}
+        by_format = self._parse_all_device_formats(output) if output.strip() else {}
+        last_result: tuple[int, int, float, FFmpegRawVideoCapture | None] = (
+            width,
+            height,
+            float(fallback_fps),
+            None,
         )
-        self.advertised_modes = dict(resolution_fps_ranges)
-        if not resolution_fps_ranges:
-            # Could not enumerate modes: try the requested one directly.
-            ladder = [(width, height, float(fallback_fps))]
-        else:
-            ladder = self._build_calibration_ladder(width, height, float(fallback_fps), resolution_fps_ranges)
-        return self._calibrate_capture_mode(device_name, ladder)
+        for fmt in self._format_try_order(by_format, self._card_pixel_format):
+            ranges = by_format.get(fmt, {}) if fmt else {}
+            self._active_pixel_format = fmt
+            self.advertised_modes = dict(ranges)
+            if ranges:
+                ladder = self._build_calibration_ladder(width, height, float(fallback_fps), ranges)
+            else:
+                ladder = [(width, height, float(fallback_fps))]
+            probed_width, probed_height, probed_fps, live = self._calibrate_capture_mode(device_name, ladder)
+            last_result = (probed_width, probed_height, probed_fps, live)
+            if live is not None:
+                return last_result
+            if self.last_open_error and self._error_means_busy(self.last_open_error):
+                return last_result
 
-    def _parse_device_modes(
-        self, output: str, preferred_format: str | None = None
-    ) -> dict[tuple[int, int], tuple[float, float]]:
-        """Parse every `pixel_format=... min/max s=...` and `s=... fps=...`
-        line into {(width, height): (min_fps, max_fps)}, scoped to the block
-        of the pixel format we request (bgr24 unless capture_pixel_format
-        says otherwise) since
-        a device can advertise a narrower fps ceiling for bgr24 than for its
-        other formats at the same resolution. A device can also report
-        several lines for the *same* (format, resolution) pair -- e.g. a
-        range line capping at 120fps plus a separate discrete line at
-        144.001fps for bgr24 at 2560x1440 on the development card -- so the
-        parsed range is a union across every line seen, not just the first."""
+        unconstrained = self._open_unconstrained_capture(device_name, width, height, fallback_fps)
+        if unconstrained is not None:
+            self._active_pixel_format = None
+            return width, height, float(fallback_fps), unconstrained
+        return last_result
+
+    def _parse_all_device_formats(
+        self, output: str
+    ) -> dict[str, dict[tuple[int, int], tuple[float, float]]]:
         by_format: dict[str, dict[tuple[int, int], tuple[float, float]]] = {}
 
         def merge(fmt: str, resolution: tuple[int, int], low_fps: float, high_fps: float) -> None:
@@ -982,9 +1018,11 @@ class FrameSource:
                 min_fps = float(range_match.group(4))
                 max_w, max_h = int(range_match.group(5)), int(range_match.group(6))
                 max_fps = float(range_match.group(7))
-                # Devices report identical min/max *resolution* per line with
-                # the *frame rate* varying across the range; key on the
-                # resolution and union the fps span it advertises.
+                # Some DirectShow drivers emit `inf` for the lower bound of
+                # a fixed high-resolution mode. The finite upper bound is the
+                # usable advertised rate in that case.
+                if not math.isfinite(min_fps):
+                    min_fps = max_fps
                 merge(fmt, (max_w, max_h), min(min_fps, max_fps), max(min_fps, max_fps))
                 continue
 
@@ -994,15 +1032,37 @@ class FrameSource:
                 mode_w, mode_h = int(discrete_match.group(2)), int(discrete_match.group(3))
                 mode_fps = float(discrete_match.group(4))
                 merge(fmt, (mode_w, mode_h), mode_fps, mode_fps)
+        return by_format
 
-        for fmt in (preferred_format, "bgr24"):
+    def _format_try_order(
+        self, by_format: dict[str, dict[tuple[int, int], tuple[float, float]]], preferred: str | None
+    ) -> list[str | None]:
+        ordered: list[str | None] = []
+        for fmt in (preferred,) + _PIXEL_FORMAT_TRY_ORDER:
+            if fmt and fmt in by_format and fmt not in ordered:
+                ordered.append(fmt)
+        for fmt in by_format:
+            if fmt not in ordered and not str(fmt).startswith("0x"):
+                ordered.append(fmt)
+        return ordered or [preferred]
+
+    def _parse_device_modes(
+        self, output: str, preferred_format: str | None = None
+    ) -> dict[tuple[int, int], tuple[float, float]]:
+        """Parse every `pixel_format=... min/max s=...` and `s=... fps=...`
+        line into {(width, height): (min_fps, max_fps)}, scoped to the block
+        of the pixel format we request (bgr24 unless capture_pixel_format
+        says otherwise) since
+        a device can advertise a narrower fps ceiling for bgr24 than for its
+        other formats at the same resolution. A device can also report
+        several lines for the *same* (format, resolution) pair -- e.g. a
+        range line capping at 120fps plus a separate discrete line at
+        144.001fps for bgr24 at 2560x1440 on the development card -- so the
+        parsed range is a union across every line seen, not just the first."""
+        by_format = self._parse_all_device_formats(output)
+        for fmt in self._format_try_order(by_format, preferred_format):
             if fmt and fmt in by_format:
                 return by_format[fmt]
-        if by_format:
-            # No explicit bgr24 block advertised -- fall back to whichever
-            # pixel format block the device did report so calibration still
-            # gets a real, device-derived candidate list, not an empty one.
-            return next(iter(by_format.values()))
         return {}
 
     def _build_calibration_ladder(
@@ -1095,12 +1155,86 @@ class FrameSource:
 
         return ordered
 
+    def _open_fallback_capture(
+        self, device_name: str, width: int, height: int, fps: float
+    ) -> "FFmpegRawVideoCapture | None":
+        """Re-open a mode that delivered pictures but missed the strict fps bar.
+
+        The passing probe is normally kept live; this path only runs after every
+        candidate was closed, so the card is free. Better a degraded live feed
+        than a blank canvas. Never used for a mode that failed to open at all
+        (Elgato 'Could not set video options') — that just restalls ffmpeg.
+        """
+        _wait_for_lingering_ffmpeg()
+        time.sleep(_CALIBRATION_SETTLE_SEC)
+        try:
+            probe = FFmpegRawVideoCapture(
+                device_name,
+                int(width),
+                int(height),
+                max(1, int(round(fps))),
+                pixel_format=self._active_pixel_format,
+            )
+        except Exception:
+            return None
+        if self._capture_has_frames(probe):
+            print(f"[CAPTURE] [CALIBRATE] {int(width)}x{int(height)}@{fps:.0f}: degraded fallback")
+            return probe
+        probe.release()
+        return None
+
+    def _open_unconstrained_capture(
+        self, device_name: str, width: int, height: int, fps: int
+    ) -> "FFmpegRawVideoCapture | None":
+        """Open the dshow pin with no size/rate/format pin — Elgato's driver
+        often accepts that after every pinned mode returns I/O error."""
+        _wait_for_lingering_ffmpeg()
+        time.sleep(_CALIBRATION_SETTLE_SEC)
+        try:
+            probe = FFmpegRawVideoCapture(
+                device_name,
+                int(width),
+                int(height),
+                max(1, int(fps)),
+                pixel_format=None,
+                pin_input_mode=False,
+            )
+        except Exception:
+            return None
+        if self._capture_has_frames(probe, timeout=3.0):
+            print(f"[CAPTURE] [CALIBRATE] driver-default open {int(width)}x{int(height)}")
+            return probe
+        probe.release()
+        return None
+
+    def _capture_has_frames(self, probe: "FFmpegRawVideoCapture", timeout: float = 2.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not probe.isOpened():
+                err = probe.get_last_error()
+                if err:
+                    self.last_open_error = err
+                return False
+            ok, frame = probe.read()
+            if ok and frame is not None:
+                return True
+            err = probe.get_last_error()
+            if err and self._error_means_unsupported_mode(err):
+                self.last_open_error = err
+                return False
+            time.sleep(0.01)
+        err = probe.get_last_error()
+        if err:
+            self.last_open_error = err
+        return False
+
     def _calibrate_capture_mode(
         self, device_name: str, ladder: list[tuple[int, int, float]]
     ) -> tuple[int, int, float, "FFmpegRawVideoCapture | None"]:
         hd_ladder = [mode for mode in ladder if mode[1] >= _MIN_AUTO_HEIGHT]
         low_ladder = [mode for mode in ladder if mode[1] < _MIN_AUTO_HEIGHT]
         last_resort = (hd_ladder[0] if hd_ladder else None) or (ladder[-1] if ladder else (1920, 1080, 60.0))
+        best_soft: tuple[int, int, float] | None = None
 
         # Every candidate gets one strict, real hardware test, and the first
         # one that passes is handed back *still running* as the live capture.
@@ -1123,22 +1257,29 @@ class FrameSource:
                     return width, height, fps, probe
                 return (*last_resort, None)
             if frame_count == 0:
-                # Opened but produced nothing at all: no signal on this mode.
-                # Probing every remaining mode would stall startup for
-                # minutes; hand back the preferred mode and let the capture
-                # loop report the stall.
-                return (*last_resort, None)
+                # Opened but produced nothing at all: no signal on this mode,
+                # or the driver rejected the pin options. Keep probing.
+                continue
+            if best_soft is None:
+                best_soft = (width, height, fps)
 
-        if hd_ladder:
-            return (*last_resort, None)
+        if not hd_ladder:
+            for width, height, fps in low_ladder:
+                passed, frame_count, probe = self._measure_candidate(device_name, width, height, fps)
+                if passed:
+                    return width, height, fps, probe
+                if self.last_open_error and self._error_means_busy(self.last_open_error):
+                    break
+                if frame_count > 0 and best_soft is None:
+                    best_soft = (width, height, fps)
+                    continue
+                if frame_count == 0:
+                    break
 
-        for width, height, fps in low_ladder:
-            passed, frame_count, probe = self._measure_candidate(device_name, width, height, fps)
-            if passed:
-                return width, height, fps, probe
-            if frame_count == 0 or (self.last_open_error and self._error_means_busy(self.last_open_error)):
-                break
-
+        if best_soft is not None:
+            probe = self._open_fallback_capture(device_name, best_soft[0], best_soft[1], best_soft[2])
+            if probe is not None:
+                return best_soft[0], best_soft[1], best_soft[2], probe
         return (*last_resort, None)
 
     def _verify_candidate_strict(
@@ -1154,7 +1295,7 @@ class FrameSource:
         returned (still streaming) when the candidate passed."""
         try:
             probe = FFmpegRawVideoCapture(
-                device_name, width, height, int(round(fps)), pixel_format=self._card_pixel_format
+                device_name, width, height, int(round(fps)), pixel_format=self._active_pixel_format
             )
         except Exception:
             return False, 0, None
@@ -1202,8 +1343,11 @@ class FrameSource:
         if passed:
             return True, frame_count + warmup_frames, probe
 
+        err = probe.get_last_error()
+        if err:
+            self.last_open_error = err
         if busy:
-            self.last_open_error = probe.get_last_error()
+            self.last_open_error = err or self.last_open_error
         probe.release()
         time.sleep(_CALIBRATION_SETTLE_SEC)
         return False, frame_count + warmup_frames, None
@@ -1318,13 +1462,25 @@ class FrameSource:
         lowered = text.lower()
         return "already in use" in lowered or "resource busy" in lowered
 
+    @staticmethod
+    def _error_means_unsupported_mode(text: str) -> bool:
+        lowered = text.lower()
+        return "could not set video options" in lowered or (
+            "i/o error" in lowered and "opening input" in lowered
+        )
+
     def open_error_message(self) -> str:
         """Human-readable reason for the last failed open, if known."""
         if self.last_open_error and self._error_means_busy(self.last_open_error):
             return (
-                "Capture card is exclusive and did not open. Close OBS/Streamlabs/RECentral if they have "
-                "this device, wait a second, then RESCAN. If CheatVision just restarted, the previous "
-                "ffmpeg may still be releasing the card."
+                "Capture card is exclusive and did not open. Close OBS/Streamlabs/RECentral/4K Capture "
+                "Utility if they have this device, wait a second, then RESCAN. If CheatVision just "
+                "restarted, the previous ffmpeg may still be releasing the card."
+            )
+        if self.last_open_error and self._error_means_unsupported_mode(self.last_open_error):
+            return (
+                "Capture card rejected the video mode (Could not set video options). Close 4K Capture "
+                "Utility and OBS, then RESCAN. Elgato 4K60 Pro MK.2 usually needs NV12, not RGB."
             )
         return self.last_open_error or ""
 
@@ -1539,6 +1695,11 @@ def _list_directshow_video_names() -> list[str]:
 
 def ffmpeg_on_path() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def wait_for_lingering_ffmpeg(timeout: float = _LINGERING_WAIT_SEC) -> int:
+    """Block until earlier ffmpeg captures have released the device."""
+    return _wait_for_lingering_ffmpeg(timeout)
 
 
 def discover_directshow_devices() -> list[dict[str, str | int]]:

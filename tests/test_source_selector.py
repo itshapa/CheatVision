@@ -19,7 +19,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 _APP = QApplication.instance() or QApplication([])
 
 from src.core.frame_source import BROWSER_WINDOW_DEVICE, FrameSource, is_browser_window_device  # noqa: E402
-from src.ui.left_rail import LeftRail  # noqa: E402
+from src.ui.control_bar import ControlBar  # noqa: E402
+from src.ui.left_rail import IMPORTED_VOD_TOKEN, LeftRail  # noqa: E402
 
 _DEVICES = [
     {"label": "AVerMedia HD Capture GC573 1 (DirectShow 1)", "name": "AVerMedia HD Capture GC573 1", "index": 1, "kind": "Capture Card"},
@@ -126,6 +127,50 @@ class BrowserWindowInputTests(unittest.TestCase):
         self.assertTrue(is_browser_window_device(dict(BROWSER_WINDOW_DEVICE)))
         self.assertFalse(is_browser_window_device(_DEVICES[0]))
         self.assertFalse(is_browser_window_device(None))
+
+
+class ImportedVodSourceTests(unittest.TestCase):
+    def test_imported_file_is_selected_instead_of_the_capture_card(self) -> None:
+        rail = LeftRail()
+        rail.set_devices(_DEVICES, "AVerMedia HD Capture GC573 1")
+        got: list[str] = []
+        rail.sourceSelected.connect(lambda name: got.append(name))
+        rail.set_imported_source("clip.mp4")
+        self.assertEqual(rail.source_combo.currentData(), IMPORTED_VOD_TOKEN)
+        self.assertEqual(rail.source_combo.currentText(), "clip.mp4")
+        self.assertIn("not the capture card", rail.source_combo.toolTip())
+        self.assertEqual(got, [])
+
+    def test_clearing_imported_file_reselects_the_capture_card_without_emitting(self) -> None:
+        rail = LeftRail()
+        rail.set_devices(_DEVICES, "AVerMedia HD Capture GC573 1")
+        rail.set_imported_source("clip.mp4")
+        got: list[str] = []
+        rail.sourceSelected.connect(lambda name: got.append(name))
+        rail.clear_imported_source()
+        self.assertEqual(rail.source_combo.currentData(), "AVerMedia HD Capture GC573 1")
+        self.assertEqual(got, [])
+        self.assertNotIn(IMPORTED_VOD_TOKEN, [data for _, data in _items(rail.source_combo)])
+
+    def test_picking_the_card_after_import_emits_so_live_can_restart(self) -> None:
+        rail = LeftRail()
+        rail.set_devices(_DEVICES, "AVerMedia HD Capture GC573 1")
+        rail.set_imported_source("clip.mp4")
+        got: list[str] = []
+        rail.sourceSelected.connect(lambda name: got.append(name))
+        card_index = next(i for i in range(rail.source_combo.count()) if rail.source_combo.itemData(i) == "AVerMedia HD Capture GC573 1")
+        rail.source_combo.setCurrentIndex(card_index)
+        self.assertEqual(got, ["AVerMedia HD Capture GC573 1"])
+
+
+class LiveImportToggleTests(unittest.TestCase):
+    def test_import_button_becomes_live_while_a_vod_is_mounted(self) -> None:
+        bar = ControlBar()
+        self.assertEqual(bar.mount_vod_btn.text(), "IMPORT")
+        bar.set_stream_mode("vod")
+        self.assertEqual(bar.mount_vod_btn.text(), "LIVE")
+        bar.set_stream_mode("live")
+        self.assertEqual(bar.mount_vod_btn.text(), "IMPORT")
 
 
 if __name__ == "__main__":

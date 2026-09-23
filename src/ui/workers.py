@@ -351,11 +351,13 @@ class CaptureWorker(QObject):
 
                 self._frame_sequence += 1
                 timestamp = time.time()
+                kind = str(self._settings.get("capture_device_kind", "") or "").strip()
+                source = kind.lower().replace(" ", "_") if kind else str(self._settings.get("capture_mode", "camera"))
                 context = FrameContext(
                     frame=frame,
                     timestamp=timestamp,
                     frame_id=self._frame_sequence,
-                    source=str(self._settings.get("capture_mode", "camera")),
+                    source=source,
                     is_duplicate=False,
                 )
                 self._live_frame_timestamps.append(now_mono)
@@ -468,7 +470,7 @@ class PlaybackWorker(QObject):
                 frame=frame,
                 timestamp=time.time(),
                 frame_id=frame_id,
-                source="video_playback_stream",
+                source="vod_file",
                 is_duplicate=False,
             )
             with self._frame_condition:
@@ -520,7 +522,7 @@ class PlaybackWorker(QObject):
             frame=frame,
             timestamp=time.time(),
             frame_id=frame_id,
-            source="timeline_seek_review",
+            source="vod_file",
             is_duplicate=False,
         )
         with self._frame_condition:

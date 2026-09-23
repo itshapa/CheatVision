@@ -27,6 +27,7 @@ from src.core.frame_source import (
     discover_directshow_devices,
     is_browser_window_device,
     pick_preferred_capture_device,
+    wait_for_lingering_ffmpeg,
 )
 from src.core.live_overlay import PixelVisionLiveOverlay
 from src.ui.advanced_overlay import PixelVisionAdvancedOverlayEngine
@@ -296,9 +297,10 @@ class MainWindow(QMainWindow):
             self._capture_worker.stop()
         if self._capture_thread is not None:
             self._capture_thread.quit()
-            self._capture_thread.wait(5000)
+            self._capture_thread.wait(15000)
         self._capture_worker = None
         self._capture_thread = None
+        wait_for_lingering_ffmpeg()
         self.video_canvas.clear_frame()
 
     def _teardown_playback(self) -> None:
@@ -315,7 +317,18 @@ class MainWindow(QMainWindow):
     # Control bar actions
     # ------------------------------------------------------------------
     def _on_mount_vod_requested(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Mount Gameplay VOD", "", "Video Files (*.mp4 *.mkv *.avi)")
+        if self._stream_mode == "vod":
+            device = self._current_device or self._choose_startup_device(self._known_devices)
+            self.left_rail.clear_imported_source()
+            self._restart_capture(device)
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Mount Gameplay VOD",
+            "",
+            "Video Files (*.mp4 *.mkv *.avi *.mov *.webm *.ts *.m4v *.mpg *.mpeg);;All Files (*)",
+        )
         if not path:
             return
 
@@ -346,6 +359,8 @@ class MainWindow(QMainWindow):
         self._apply_mask(self._vod_mask_profile)
 
         self._mounted_vod_name = Path(path).name
+        self.left_rail.set_imported_source(self._mounted_vod_name)
+        self.left_rail.set_source(self._mounted_vod_name, "opening…", "VOD")
         self._flagged_track_ids = OrderedDict()
         if self._render_worker is not None:
             self._render_worker.set_flagged_track_ids(())
@@ -413,6 +428,7 @@ class MainWindow(QMainWindow):
         self._is_stream_frozen = False
         self.pipeline.set_stream_frozen(False)
         self.control_bar.set_stream_mode(self._stream_mode)
+        self.left_rail.clear_imported_source()
         self.left_rail.set_mode_picker_enabled(self._stream_mode == "live")
         if is_browser_window_device(device):
             # A browser tab is a stream page by definition.
@@ -433,6 +449,11 @@ class MainWindow(QMainWindow):
         preferred = self._choose_startup_device(devices)
         preferred_name = str(preferred.get("name", "")) if preferred else ""
         self.left_rail.set_devices(devices, preferred_name)
+
+        if self._stream_mode == "vod":
+            self.left_rail.set_imported_source(getattr(self, "_mounted_vod_name", "VOD"))
+            self.status_label.setText("RESCAN: devices updated · VOD still mounted")
+            return
 
         capture_alive = self._capture_thread is not None and self._capture_thread.isRunning()
         if preferred_name == self._current_device_name and capture_alive:
@@ -491,7 +512,7 @@ class MainWindow(QMainWindow):
         self._persist_setting("capture_device_name", device_name)
         self._persist_setting("capture_device_kind", str(device.get("kind", "")))
         capture_alive = self._capture_thread is not None and self._capture_thread.isRunning()
-        if device_name == self._current_device_name and capture_alive:
+        if self._stream_mode != "vod" and device_name == self._current_device_name and capture_alive:
             return
         self.status_label.setText(f"Switching source: {device.get('label', device_name)}")
         self._restart_capture(device)
@@ -598,6 +619,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     @Slot(int, int, float, str)
     def _on_capture_source_opened(self, width: int, height: int, fps: float, backend: str) -> None:
+        if self._stream_mode != "live":
+            return
         self._stream_mode = "live"
         self._is_stream_frozen = False
         if self._feed_starved:
@@ -659,12 +682,16 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_capture_error(self, message: str) -> None:
+        if self._stream_mode != "live":
+            return
         # Canvas back to the brand mark; the message stays in the status text.
         self.video_canvas.clear_frame()
         self.status_label.setText(f"CAPTURE ERROR: {message}")
 
     @Slot(bool)
     def _on_capture_stream_frozen(self, is_frozen: bool) -> None:
+        if self._stream_mode != "live":
+            return
         self._is_stream_frozen = is_frozen
         self.pipeline.set_stream_frozen(is_frozen)
         if is_frozen:
@@ -679,6 +706,8 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_waiting_for_capture(self) -> None:
+        if self._stream_mode != "live":
+            return
         self.video_canvas.clear_frame()
         self.status_label.setText("Waiting for capture device")
 
@@ -706,6 +735,8 @@ class MainWindow(QMainWindow):
         self.left_rail.set_analysis_rate(self.pipeline.analysis_cadence_hz, self.pipeline.analysis_stride)
 
     def _on_feed_rate_measured(self, delivered_fps: float, unique_fps: float, starved: bool) -> None:
+        if self._stream_mode != "live":
+            return
         self.left_rail.set_feed_rate(delivered_fps, unique_fps, starved=starved)
         # Only new pictures are analysed, so the cadence follows the unique rate.
         self._apply_feed_rate(unique_fps if unique_fps > 0 else delivered_fps)
